@@ -1,0 +1,35 @@
+isli_version: "2.0"
+id: "moroccan-cassation-search"
+name: "Moroccan Cassation Court Search"
+description: "Search and retrieve decisions from the Moroccan Court of Cassation (juriscassation.cspj.ma), jurisprudence.ma, and adala.justice.gov.ma."
+version: "1.0.0"
+author: "ISLI Developer"
+category: "web"
+
+runtime:
+  port: 8000
+  build:
+    context: "."
+    dockerfile: "Dockerfile"
+
+auth:
+  type: "none"
+
+tools:
+  - name: search_decisions
+    description: "Search for Moroccan court decisions by subject or keyword."
+    endpoint: "/search"
+    method: "POST"
+    parameters:
+      type: "object"
+      properties:
+        query:
+          type: "string"
+          description: "The main keyword or subject to search for (e.g., 'طلاق', 'سرقة')."
+        chamber_id:
+          type: "integer"
+          description: "Optional. ID of the chamber (1=Civil, 2=Family/Inheritance, 3=Commercial, 4=Administrative, 5=Social, 6=Criminal, 7=Real Estate)."
+        decision_number:
+          type: "string"
+          description: "Optional. Number of the decision."
+      required: ["query"]
