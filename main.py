@@ -46,6 +46,27 @@ class SearchResponse(BaseModel):
     sources: Dict[str, SourceResult]
 
 
+def _is_network_unreachable(error: Optional[str]) -> bool:
+    """True when a requests-side failure is a connectivity/timeout issue for
+    which a Playwright fallback to the same host would also fail (and waste
+    ~30s of dead time per call). Used to fast-fail the CSPJ browser fallback
+    when the site is unreachable from this server's egress."""
+    if not error:
+        return False
+    low = error.lower()
+    return any(
+        sig in low
+        for sig in (
+            "timed out",
+            "timeout",
+            "connect",
+            "fetch failed",
+            "failed to establish",
+            "connection",
+        )
+    )
+
+
 class JurisCassationClient:
     BASE_URL = "https://juriscassation.cspj.ma"
     CHAMBERS = {
@@ -80,7 +101,10 @@ class JurisCassationClient:
         try:
             r = self.session.get(
                 f"{self.BASE_URL}/Decisions/RechercheDecisions",
-                timeout=20,
+                # (connect, read) tuple: fail fast (5s) when the host is
+                # unreachable from this server's egress, but allow 20s for the
+                # page to be read once a connection is established.
+                timeout=(5, 20),
                 headers={"Referer": f"{self.BASE_URL}/Decisions/RechercheDecisions"},
             )
             r.raise_for_status()
@@ -316,6 +340,22 @@ class JurisCassationClient:
         if res.status == "ok" and res.count > 0:
             return res
 
+        # If requests failed because the host is unreachable (timeout /
+        # connection error), a Playwright fallback to the SAME unreachable
+        # host will also fail — but only after burning ~30s on browser launch
+        # + navigation timeouts. Fast-fail instead of trying the browser.
+        if res.status == "error" and _is_network_unreachable(res.error):
+            return SourceResult(
+                status="error",
+                count=0,
+                results=[],
+                error=res.error,
+                meta={
+                    "method": "requests",
+                    "playwright_skipped": "network_unreachable",
+                },
+            )
+
         # If requests failed or returned nothing, try a real browser
         pw_res = await self._search_with_playwright(
             subject=subject,
@@ -423,6 +463,19 @@ _AR_TO_FR_FALLBACK = {
     "تزوير": "faux",
     "قتل": "homicide",
     "إثبات": "preuve",
+    "نفقة": "pension",
+    "ميراث": "succession",
+    "حضانة": "garde",
+    "بيع": "vente",
+    "عمل": "travail",
+    "مسؤولية": "responsabilite",
+    "إخلاء": "expulsion",
+    "رهن": "hypotheque",
+    "إفلاس": "faillite",
+    "محكمة": "tribunal",
+    "طرد": "licenciement",
+    "أجرة": "salaire",
+    "ضرر": "prejudice",
 }
 
 
@@ -495,10 +548,140 @@ class AdalaClient:
     BASE_URL = "https://adala.justice.gov.ma"
     SEARCH_PATH = "/search"
 
+    def _build_url(self, query: str) -> str:
+        # NOTE: adala's `?term=...&type=rapid_search` returns an EMPTY
+        # searchResult for every query (verified 2026-07-03). Using the bare
+        # `?q=...` param returns the populated searchResult (and
+        # lawsResult/themesResult) — e.g. 15 decisions for "طلاق".
+        return f"{self.BASE_URL}{self.SEARCH_PATH}?q={quote(query)}"
+
+    def _parse_html(self, content: str) -> List[Dict]:
+        """Extract adala decisions from page HTML. adala is a Next.js app whose
+        `__NEXT_DATA__` JSON payload is embedded in the server-rendered HTML, so
+        the same parser works for both a plain requests GET and a Playwright
+        render. Falls back to DOM <a> scraping if the JSON payload is absent."""
+        results: List[Dict] = []
+        soup = BeautifulSoup(content, "html.parser")
+
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data and next_data.string:
+            try:
+                import json
+
+                data = json.loads(next_data.string)
+                search_res = (
+                    data.get("props", {})
+                    .get("pageProps", {})
+                    .get("searchResult", {})
+                )
+                if isinstance(search_res, dict):
+                    items = search_res.get("data", [])
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict):
+                                title = (
+                                    item.get("title")
+                                    or item.get("name")
+                                    or "Adala Document"
+                                )
+                                slug = item.get("slug") or item.get("id")
+                                path = item.get("path")
+                                if slug:
+                                    link = f"{self.BASE_URL}/resource/{slug}"
+                                elif path:
+                                    # adala exposes relative upload paths
+                                    # (e.g. "uploads/2024/...pdf") for PDF
+                                    # results rather than slug-based URLs.
+                                    link = (
+                                        path
+                                        if path.startswith("http")
+                                        else f"{self.BASE_URL}/{path}"
+                                    )
+                                else:
+                                    link = None
+                                results.append({
+                                    "title": title,
+                                    "link": link,
+                                    "source": "adala.justice.gov.ma",
+                                    "raw": item,
+                                })
+            except Exception:
+                pass
+
+        # DOM-level fallback
+        if not results:
+            selectors = [
+                "a[href*='/resource/']",
+                "a[href*='/law/']",
+                "a[href*='/decision/']",
+                "a[href*='/text/']",
+                ".search-result-item a",
+                ".result-card a",
+                "article a",
+            ]
+            seen_hrefs = set()
+            for selector in selectors:
+                for a in soup.select(selector):
+                    href = a.get("href")
+                    if not href:
+                        continue
+                    full_href = (
+                        href
+                        if href.startswith("http")
+                        else f"{self.BASE_URL}{href}"
+                    )
+                    if full_href in seen_hrefs:
+                        continue
+                    seen_hrefs.add(full_href)
+                    text = a.get_text(strip=True) or "Adala Document"
+                    results.append({
+                        "title": text,
+                        "link": full_href,
+                        "source": "adala.justice.gov.ma",
+                    })
+        return results
+
     async def search(self, query: str) -> SourceResult:
-        results = []
+        url = self._build_url(query)
+
+        # Fast path: adala's __NEXT_DATA__ JSON is embedded in the raw
+        # server-rendered HTML, so a plain requests GET is enough (verified
+        # 2026-07-03) and ~20x faster than launching Chromium.
+        req_err: Optional[str] = None
+        try:
+            r = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                verify=False,
+                timeout=(5, 15),
+            )
+            r.raise_for_status()
+            results = self._parse_html(r.text)
+            if results:
+                return SourceResult(
+                    status="ok",
+                    count=len(results),
+                    results=results,
+                    meta={"method": "requests"},
+                )
+            # Reached the page but found nothing. If __NEXT_DATA__ is present
+            # the search genuinely has no matches — don't waste a browser run.
+            if "__NEXT_DATA__" in r.text:
+                return SourceResult(
+                    status="ok",
+                    count=0,
+                    results=[],
+                    meta={"method": "requests", "note": "no results"},
+                )
+        except Exception as e:
+            req_err = str(e)
+
+        # Fallback: render with a real browser (only when requests didn't get
+        # the embedded JSON — e.g. JS-only rendering or a requests block).
         browser = None
         try:
+            if not PLAYWRIGHT_AVAILABLE or async_playwright is None:
+                raise Exception("Playwright not available")
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context(
@@ -509,18 +692,11 @@ class AdalaClient:
                     locale="ar",
                 )
                 page = await context.new_page()
-                url = (
-                    f"{self.BASE_URL}{self.SEARCH_PATH}"
-                    f"?term={quote(query)}&type=rapid_search"
-                )
                 await page.goto(url, wait_until="networkidle", timeout=30000)
-
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
-
-                # Wait for results if selectors are known
                 for selector in [
                     "div.search-result-item",
                     "article",
@@ -532,82 +708,16 @@ class AdalaClient:
                         break
                     except Exception:
                         continue
-
                 content = await page.content()
-                soup = BeautifulSoup(content, "html.parser")
-
-                next_data = soup.find("script", id="__NEXT_DATA__")
-                if next_data and next_data.string:
-                    try:
-                        import json
-
-                        data = json.loads(next_data.string)
-                        search_res = (
-                            data.get("props", {})
-                            .get("pageProps", {})
-                            .get("searchResult", {})
-                        )
-                        if isinstance(search_res, dict):
-                            items = search_res.get("data", [])
-                            if isinstance(items, list):
-                                for item in items:
-                                    if isinstance(item, dict):
-                                        title = (
-                                            item.get("title")
-                                            or item.get("name")
-                                            or "Adala Document"
-                                        )
-                                        slug = item.get("slug") or item.get("id")
-                                        link = (
-                                            f"{self.BASE_URL}/resource/{slug}"
-                                            if slug
-                                            else None
-                                        )
-                                        results.append({
-                                            "title": title,
-                                            "link": link,
-                                            "source": "adala.justice.gov.ma",
-                                            "raw": item,
-                                        })
-                    except Exception:
-                        pass
-
-                # DOM-level fallback
-                if not results:
-                    selectors = [
-                        "a[href*='/resource/']",
-                        "a[href*='/law/']",
-                        "a[href*='/decision/']",
-                        "a[href*='/text/']",
-                        ".search-result-item a",
-                        ".result-card a",
-                        "article a",
-                    ]
-                    seen_hrefs = set()
-                    for selector in selectors:
-                        for a in soup.select(selector):
-                            href = a.get("href")
-                            if not href:
-                                continue
-                            full_href = (
-                                href
-                                if href.startswith("http")
-                                else f"{self.BASE_URL}{href}"
-                            )
-                            if full_href in seen_hrefs:
-                                continue
-                            seen_hrefs.add(full_href)
-                            text = a.get_text(strip=True) or "Adala Document"
-                            results.append({
-                                "title": text,
-                                "link": full_href,
-                                "source": "adala.justice.gov.ma",
-                            })
-
+                results = self._parse_html(content)
                 await browser.close()
                 browser = None
-
-            return SourceResult(status="ok", count=len(results), results=results)
+            return SourceResult(
+                status="ok",
+                count=len(results),
+                results=results,
+                meta={"method": "playwright"},
+            )
         except Exception as e:
             if browser:
                 try:
@@ -618,7 +728,7 @@ class AdalaClient:
                 status="error",
                 count=0,
                 results=[],
-                error=f"adala.justice.gov.ma failed: {str(e)}",
+                error=f"adala.justice.gov.ma failed: {req_err or str(e)}",
             )
 
 
@@ -761,11 +871,20 @@ async def search_decisions(req: SearchRequest):
         sources["cache"] = _get_static_fallback(req.query)
         total = sources["cache"].count
 
-    overall_status = "success" if total > 0 else "no_results"
-    if any(s.status == "error" for s in sources.values()) and total == 0:
+    # Status semantics: a single erroring source (e.g. CSPJ unreachable) must
+    # NOT poison the top-level status to "error" when other sources are healthy
+    # or merely empty. "error" is reserved for the case where EVERY live source
+    # failed (the static-cache trigger condition above). This stops the agent's
+    # ReAct loop from treating "one source down, others empty" as a tool fault.
+    errored = [s for s in sources.values() if s.status == "error"]
+    all_errored = len(errored) == len(sources)
+    if total > 0:
+        overall_status = "partial_success" if errored else "success"
+    elif all_errored:
         overall_status = "error"
-    elif any(s.status == "error" for s in sources.values()):
-        overall_status = "partial_success"
+    else:
+        # Some sources OK but empty (and possibly some errored) — not a fault.
+        overall_status = "no_results"
 
     flat_results = []
     for source_name, source in sources.items():
