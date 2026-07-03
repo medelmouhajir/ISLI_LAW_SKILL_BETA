@@ -26,6 +26,7 @@ class SourceResult(BaseModel):
     count: int
     results: List[Dict]
     error: Optional[str] = None
+    meta: Optional[Dict] = None
 
 
 class SearchResponse(BaseModel):
@@ -64,12 +65,14 @@ class JurisCassationClient:
             "Accept-Language": "ar,fr;q=0.9,en;q=0.8",
         })
         self.token = None
+        self.last_error = None
 
     def _get_csrf_token(self) -> Optional[str]:
+        self.last_error = None
         try:
             r = self.session.get(
                 f"{self.BASE_URL}/Decisions/RechercheDecisions",
-                timeout=15,
+                timeout=20,
                 headers={"Referer": f"{self.BASE_URL}/Decisions/RechercheDecisions"},
             )
             r.raise_for_status()
@@ -79,22 +82,110 @@ class JurisCassationClient:
             )
             token = m.group(1) if m else None
             if not token:
-                # Try alternative patterns used by ASP.NET Core anti-forgery tokens
                 m = re.search(
                     r'value="(CfDJ[^"]+)"[^>]*name="__RequestVerificationToken"',
                     r.text,
                 )
                 token = m.group(1) if m else None
+            if not token:
+                snippet = re.sub(r"\s+", " ", r.text)[:400]
+                self.last_error = f"CSRF token not found in page. status={r.status_code} snippet={snippet}"
             self.token = token
             return token
+        except requests.exceptions.Timeout:
+            self.last_error = "CSPJ token page timed out."
+            return None
+        except requests.exceptions.HTTPError as e:
+            self.last_error = f"CSPJ token page HTTP error: {e.response.status_code}."
+            return None
         except Exception as e:
+            self.last_error = f"CSPJ token fetch failed: {str(e)}"
             return None
 
     def _refresh_token(self) -> Optional[str]:
         self.session.cookies.clear()
         return self._get_csrf_token()
 
-    def search(
+    async def _search_with_playwright(
+        self,
+        subject: str,
+        chamber_id=None,
+        decision_number=None,
+        file_number=None,
+        date=None,
+    ) -> SourceResult:
+        """Fallback that drives the CSPJ search form with a real browser."""
+        browser = None
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    locale="ar",
+                )
+                page = await context.new_page()
+                await page.goto(
+                    f"{self.BASE_URL}/Decisions/RechercheDecisions",
+                    wait_until="networkidle",
+                    timeout=30000,
+                )
+
+                # Fill the form fields if they exist
+                if chamber_id:
+                    try:
+                        await page.select_option('select[name="ChambreIds"]', str(chamber_id))
+                    except Exception:
+                        pass
+                if decision_number:
+                    await page.fill('input[name="NumeroDec"]', decision_number)
+                if file_number:
+                    await page.fill('input[name="NumeroDos"]', file_number)
+                if date:
+                    await page.fill('input[name="DateDec"]', date)
+                await page.fill('input[name="Sujet"]', subject)
+
+                # Submit and wait for result table
+                await page.click('button[type="submit"], input[type="submit"]')
+                try:
+                    await page.wait_for_selector("table#myid", timeout=15000)
+                except Exception:
+                    pass
+
+                content = await page.content()
+                results = self._parse_results(content, chamber_id=chamber_id)
+                await browser.close()
+                browser = None
+
+                if results:
+                    return SourceResult(
+                        status="ok",
+                        count=len(results),
+                        results=results,
+                        meta={"method": "playwright"},
+                    )
+                return SourceResult(
+                    status="ok",
+                    count=0,
+                    results=[],
+                    meta={"method": "playwright", "note": "no results table found"},
+                )
+        except Exception as e:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            return SourceResult(
+                status="error",
+                count=0,
+                results=[],
+                error=f"CSPJ Playwright fallback failed: {str(e)}",
+            )
+
+    def _search_with_requests(
         self,
         subject: str,
         chamber_id=None,
@@ -106,11 +197,13 @@ class JurisCassationClient:
             self._get_csrf_token()
 
         if not self.token:
+            err = self.last_error or "Could not obtain CSRF token from CSPJ."
             return SourceResult(
                 status="error",
                 count=0,
                 results=[],
-                error="Could not obtain CSRF token from CSPJ.",
+                error=err,
+                meta={"method": "requests"},
             )
 
         data = {
@@ -129,7 +222,7 @@ class JurisCassationClient:
             r = self.session.post(
                 f"{self.BASE_URL}/Decisions/RechercheDecisionsRes",
                 data=data,
-                timeout=20,
+                timeout=25,
                 headers={
                     "Referer": referer,
                     "Origin": self.BASE_URL,
@@ -138,8 +231,6 @@ class JurisCassationClient:
             )
             r.raise_for_status()
 
-            # Sometimes CSPJ returns the search page again with a new token if
-            # the previous one expired. Detect that and retry once.
             if "__RequestVerificationToken" in r.text and not self._parse_results(
                 r.text, chamber_id=chamber_id
             ):
@@ -149,7 +240,7 @@ class JurisCassationClient:
                     r = self.session.post(
                         f"{self.BASE_URL}/Decisions/RechercheDecisionsRes",
                         data=data,
-                        timeout=20,
+                        timeout=25,
                         headers={
                             "Referer": referer,
                             "Origin": self.BASE_URL,
@@ -163,6 +254,7 @@ class JurisCassationClient:
                 status="ok",
                 count=len(results),
                 results=results,
+                meta={"method": "requests"},
             )
         except requests.exceptions.Timeout:
             return SourceResult(
@@ -170,6 +262,7 @@ class JurisCassationClient:
                 count=0,
                 results=[],
                 error="CSPJ search request timed out.",
+                meta={"method": "requests"},
             )
         except requests.exceptions.HTTPError as e:
             return SourceResult(
@@ -177,6 +270,7 @@ class JurisCassationClient:
                 count=0,
                 results=[],
                 error=f"CSPJ returned HTTP error: {e.response.status_code}.",
+                meta={"method": "requests"},
             )
         except Exception as e:
             return SourceResult(
@@ -184,14 +278,59 @@ class JurisCassationClient:
                 count=0,
                 results=[],
                 error=f"CSPJ search failed: {str(e)}",
+                meta={"method": "requests"},
             )
+
+    async def search(
+        self,
+        subject: str,
+        chamber_id=None,
+        decision_number=None,
+        file_number=None,
+        date=None,
+    ) -> SourceResult:
+        # Try lightweight requests first
+        res = self._search_with_requests(
+            subject=subject,
+            chamber_id=chamber_id,
+            decision_number=decision_number,
+            file_number=file_number,
+            date=date,
+        )
+        if res.status == "ok" and res.count > 0:
+            return res
+
+        # If requests failed or returned nothing, try a real browser
+        pw_res = await self._search_with_playwright(
+            subject=subject,
+            chamber_id=chamber_id,
+            decision_number=decision_number,
+            file_number=file_number,
+            date=date,
+        )
+        if pw_res.status == "ok" and pw_res.count > 0:
+            return pw_res
+
+        # If browser also empty but OK, prefer it (no error)
+        if pw_res.status == "ok" and res.status == "error":
+            return pw_res
+
+        # Combine errors for clarity
+        combined_error = res.error or "requests method unknown error"
+        if pw_res.error:
+            combined_error = f"{combined_error} | Playwright: {pw_res.error}"
+        return SourceResult(
+            status="error",
+            count=0,
+            results=[],
+            error=combined_error,
+            meta={"requests_status": res.status, "playwright_status": pw_res.status},
+        )
 
     def _parse_results(self, html: str, chamber_id: Optional[int] = None) -> List[Dict]:
         soup = BeautifulSoup(html, "html.parser")
         results = []
 
-        # CSPJ renders results in a table whose observed id is "myid" and whose
-        # headers are: رقم الملف | رقم القرار | تاريخ القرار | المفاتيح أو القاعدة أو المحتوى | تحميل القرار
         table = (
             soup.find("table", {"id": "myid"})
             or soup.find("table", {"id": "table-data"})
@@ -216,7 +355,6 @@ class JurisCassationClient:
                 if chamber_id and chamber_id in self.CHAMBERS:
                     row["chamber"] = self.CHAMBERS[chamber_id]
 
-                # The last cell contains the "معاينة القرار" PDF link
                 pdf_link = tr.find("a", href=re.compile(r"GetArret"))
                 if pdf_link:
                     href = pdf_link.get("href")
@@ -226,11 +364,9 @@ class JurisCassationClient:
                         )
                         row["pdf_text"] = pdf_link.get_text(strip=True)
 
-                # Keep rows that have at least a file number or a PDF link
                 if row["file_number"] or "pdf_url" in row:
                     results.append(row)
 
-        # Fallback / enrichment: grab any GetArret link even outside a table
         if not results:
             for a in soup.find_all("a", href=re.compile(r"GetArret")):
                 href = a.get("href")
@@ -250,10 +386,45 @@ class JurisCassationClient:
         return results
 
 
+# Fallback translations for common Arabic legal terms to French,
+# because jurisprudence.ma is primarily French-language content.
+_AR_TO_FR_FALLBACK = {
+    "طلاق": "divorce",
+    "سرقة": "vol",
+    "إيجار": "bail",
+    "شركة": "societe",
+    "عقد": "contrat",
+    "تعويض": "dommages",
+    "ملكية": "propriete",
+    "ورثة": "succession",
+    "دين": "dette",
+    "رسم": "acte",
+    "حكم": "jugement",
+    "استئناف": "appel",
+    "نقض": "cassation",
+    "تزوير": "faux",
+    "قتل": "homicide",
+    "إثبات": "preuve",
+}
+
+
 class JurisprudenceClient:
     BASE_URL = "https://www.jurisprudence.ma/"
 
     def search(self, query: str) -> SourceResult:
+        result = self._do_search(query)
+        # If Arabic query returns nothing, try French equivalent
+        if result.status == "ok" and result.count == 0 and any(
+            ord(c) > 127 for c in query
+        ):
+            fr_query = _AR_TO_FR_FALLBACK.get(query.strip().lower())
+            if fr_query:
+                fr_result = self._do_search(fr_query)
+                if fr_result.count > 0:
+                    return fr_result
+        return result
+
+    def _do_search(self, query: str) -> SourceResult:
         results = []
         try:
             r = requests.get(
@@ -268,8 +439,9 @@ class JurisprudenceClient:
 
             articles = soup.find_all("article")
             if not articles:
-                # Fallback: search result titles are often h2/h3 inside divs with class "post"
-                articles = soup.find_all("div", class_=re.compile(r"post|entry|result", re.I))
+                articles = soup.find_all(
+                    "div", class_=re.compile(r"post|entry|result", re.I)
+                )
 
             for article in articles:
                 title_tag = article.find(["h2", "h3"])
@@ -311,23 +483,41 @@ class AdalaClient:
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    locale="ar",
+                )
+                page = await context.new_page()
                 url = (
                     f"{self.BASE_URL}{self.SEARCH_PATH}"
                     f"?term={quote(query)}&type=rapid_search"
                 )
-                await page.goto(url, wait_until="networkidle", timeout=20000)
+                await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                # Try to wait for dynamic content; do not fail if timeout.
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
+
+                # Wait for results if selectors are known
+                for selector in [
+                    "div.search-result-item",
+                    "article",
+                    ".result-card",
+                    "#__NEXT_DATA__",
+                ]:
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000)
+                        break
+                    except Exception:
+                        continue
 
                 content = await page.content()
                 soup = BeautifulSoup(content, "html.parser")
 
-                # Next.js sometimes ships initial props in __NEXT_DATA__
                 next_data = soup.find("script", id="__NEXT_DATA__")
                 if next_data and next_data.string:
                     try:
@@ -344,7 +534,11 @@ class AdalaClient:
                             if isinstance(items, list):
                                 for item in items:
                                     if isinstance(item, dict):
-                                        title = item.get("title") or item.get("name") or "Adala Document"
+                                        title = (
+                                            item.get("title")
+                                            or item.get("name")
+                                            or "Adala Document"
+                                        )
                                         slug = item.get("slug") or item.get("id")
                                         link = (
                                             f"{self.BASE_URL}/resource/{slug}"
@@ -377,7 +571,6 @@ class AdalaClient:
                             href = a.get("href")
                             if not href:
                                 continue
-                            # Normalize relative URLs
                             full_href = (
                                 href
                                 if href.startswith("http")
@@ -393,9 +586,8 @@ class AdalaClient:
                                 "source": "adala.justice.gov.ma",
                             })
 
-                if browser:
-                    await browser.close()
-                    browser = None
+                await browser.close()
+                browser = None
 
             return SourceResult(status="ok", count=len(results), results=results)
         except Exception as e:
@@ -420,9 +612,8 @@ async def search_decisions(req: SearchRequest):
 
     sources = {}
 
-    # Primary Source: CSPJ
     try:
-        sources["cspj"] = client_cspj.search(
+        sources["cspj"] = await client_cspj.search(
             subject=req.query,
             chamber_id=req.chamber_id,
             decision_number=req.decision_number,
@@ -437,7 +628,6 @@ async def search_decisions(req: SearchRequest):
             error=f"Unhandled CSPJ error: {str(e)}",
         )
 
-    # Secondary Source: jurisprudence.ma
     try:
         sources["jurisprudence"] = client_juris.search(query=req.query)
     except Exception as e:
@@ -448,7 +638,6 @@ async def search_decisions(req: SearchRequest):
             error=f"Unhandled jurisprudence error: {str(e)}",
         )
 
-    # Tertiary Source: adala.justice.gov.ma
     try:
         sources["adala"] = await client_adala.search(query=req.query)
     except Exception as e:
@@ -466,7 +655,6 @@ async def search_decisions(req: SearchRequest):
     elif any(s.status == "error" for s in sources.values()):
         overall_status = "partial_success"
 
-    # Build a flat, backward-compatible `results` list while preserving source info.
     flat_results = []
     for source_name, source in sources.items():
         for item in source.results:
@@ -487,3 +675,16 @@ async def search_decisions(req: SearchRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.get("/debug/cspj")
+async def debug_cspj():
+    """Diagnostic endpoint: fetch CSPJ search page and report status + token availability."""
+    client = JurisCassationClient()
+    token = client._get_csrf_token()
+    return {
+        "token_found": bool(token),
+        "token_prefix": token[:20] + "..." if token else None,
+        "last_error": client.last_error,
+        "session_cookies": list(client.session.cookies.keys()),
+    }
